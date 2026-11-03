@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="font:24px sans-serif;padding:20px">
+<h2>GPS test</h2>
+<pre id="o">Waiting…</pre>
+<script>
+navigator.geolocation.watchPosition(p=>{
+  const c=p.coords;
+  o.textContent=`Lat ${c.latitude.toFixed(6)}
+Lon ${c.longitude.toFixed(6)}
+Accuracy ±${c.accuracy.toFixed(0)} m
+Speed ${c.speed??'–'} m/s
+Heading ${c.heading??'–'}°`;
+},e=>o.textContent=e.message,{enableHighAccuracy:true});
+</script>
