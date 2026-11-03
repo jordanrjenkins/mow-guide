@@ -3,32 +3,40 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 body{margin:0;font:18px sans-serif;background:#111;color:#fff}
-.row{padding:6px 8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row{padding:5px 8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 input[type=number]{width:60px;font-size:20px}
-button{font-size:19px;padding:10px 14px;border:0;border-radius:10px;background:#e5e5ea}
+button{font-size:18px;padding:9px 12px;border:0;border-radius:10px;background:#e5e5ea}
 #go{background:#2e9d3f;color:#fff}
 #fin{background:#c0392b;color:#fff}
 button:disabled{opacity:.4}
-#map{width:100vw;height:44vh;background:#1b3a1b}
-#steer{padding:8px;font:bold 28px sans-serif;text-align:center;background:#222}
+#hint{padding:4px 8px;font:17px sans-serif;color:#00e5ff;display:none}
+#map{width:100vw;height:40vh;background:#1b3a1b}
+#steer{padding:6px;font:bold 28px sans-serif;text-align:center;background:#222}
+#prog{padding:6px;font:bold 21px sans-serif;text-align:center;background:#181818;color:#00e5ff;display:none}
 #info{padding:8px;font:15px monospace;white-space:pre}
 </style>
 <div class="row">Width <input id="w" type="number" value="1.5" step="0.1"> Overlap <input id="ov" type="number" value="0.1" step="0.05"> Tol <input id="tol" type="number" value="0.3" step="0.1"></div>
 <div class="row"><button id="go">Start</button><button id="fin" disabled>Finish</button><button id="mark">Mark A</button><button id="clr">New job</button></div>
+<div class="row"><button id="brect">Rectangle</button><button id="bcirc">Circle</button><button id="bclr">Clear boundary</button></div>
 <div class="row"><label><input type="checkbox" id="follow" checked> Follow</label><label><input type="checkbox" id="snd" checked> Voice</label><button id="test">Test voice</button></div>
+<div id="hint"></div>
 <div id="map"></div>
 <div id="steer">Mark A at the start of your first pass</div>
+<div id="prog"></div>
 <div id="info">Waiting for GPS…</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-const w=$('w'),ov=$('ov'),tol=$('tol'),info=$('info'),steer=$('steer');
+const w=$('w'),ov=$('ov'),tol=$('tol'),info=$('info'),steer=$('steer'),prog=$('prog'),hint=$('hint');
 const go=$('go'),fin=$('fin'),mark=$('mark'),follow=$('follow'),snd=$('snd');
-const R=6371000,K=Math.PI/180,MAX_ACC=10,MIN_SPEED=0.3;
+const R=6371000,K=Math.PI/180,MAX_ACC=10,MIN_SPEED=0.3,CELL=0.25,DONE_FRAC=0.8;
 let origin=null,cur=null,heading=null,acc=null,spd=null;
 let state='idle',segs=[],seg=null,length=0,runStart=0,elapsed=0,lock=null;
 let A=null,guide=null,laneIdx=null,gstage=0,herr=null;
 let lastSpeak=0,lastWeak=0,wasOff=false,lastAbs=null,lastAbsT=0,converging=false;
+let bound=null,boundArea=0,gridPts=[],laneData=null,lastDone=null;
+let drawMode=null,drawPts=[];
+const covered=new Set();
 
 function say(t){
   if(!snd.checked||!('speechSynthesis' in window))return;
@@ -36,14 +44,13 @@ function say(t){
   const u=new SpeechSynthesisUtterance(t);u.rate=1.05;u.volume=1;
   speechSynthesis.speak(u);
 }
-$('test').onclick=()=>{
-  const was=snd.checked;snd.checked=true;say('Turn back right, point six metres');snd.checked=was;
-};
+$('test').onclick=()=>{const was=snd.checked;snd.checked=true;say('Turn back right, point six metres');snd.checked=was};
 
 const map=L.map('map',{zoomControl:false,maxZoom:21}).setView([0,0],2);
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
   {maxNativeZoom:17,maxZoom:21,attribution:'Imagery © Esri'}).addTo(map);
-const lanesLayer=L.layerGroup().addTo(map),swathLayer=L.layerGroup().addTo(map);
+const boundLayer=L.layerGroup().addTo(map),lanesLayer=L.layerGroup().addTo(map),
+      swathLayer=L.layerGroup().addTo(map),drawLayer=L.layerGroup().addTo(map);
 const me=L.circleMarker([0,0],{radius:8,color:'#000',weight:2,fillColor:'#fff',fillOpacity:1});
 const head=L.polyline([],{color:'#fff',weight:3});
 map.on('dragstart',()=>follow.checked=false);
@@ -55,9 +62,139 @@ function width(){return parseFloat(w.value)||1.5}
 function spacing(){return Math.max(0.2,width()-(parseFloat(ov.value)||0))}
 function wpx(m){const mpp=156543.03392*Math.cos(origin.lat*K)/Math.pow(2,map.getZoom());return Math.max(2,m/mpp)}
 function restyle(){if(!origin)return;for(const s of segs)s.line.setStyle({weight:wpx(width())})}
-w.oninput=()=>{restyle();drawLanes();text()};
-ov.oninput=()=>{drawLanes()};
+w.oninput=()=>{restyle();drawLanes();buildLanes();stats();text()};
+ov.oninput=()=>{drawLanes();buildLanes();stats()};
 
+/* ---------- coverage grid ---------- */
+function key(i,j){return(i+100000)*200003+(j+100000)}
+function isCov(x,y){return covered.has(key(Math.floor(x/CELL),Math.floor(y/CELL)))}
+function stamp(a,b){
+  const r=width()/2,d=Math.hypot(b.x-a.x,b.y-a.y),n=Math.max(1,Math.ceil(d/0.25)),rc=Math.ceil(r/CELL);
+  for(let s=0;s<=n;s++){
+    const px=a.x+(b.x-a.x)*s/n,py=a.y+(b.y-a.y)*s/n,ci=Math.floor(px/CELL),cj=Math.floor(py/CELL);
+    for(let i=-rc;i<=rc;i++)for(let j=-rc;j<=rc;j++){
+      const cx=(ci+i+0.5)*CELL,cy=(cj+j+0.5)*CELL;
+      if((cx-px)*(cx-px)+(cy-py)*(cy-py)<=r*r)covered.add(key(ci+i,cj+j));
+    }
+  }
+}
+
+/* ---------- boundary ---------- */
+function inPoly(x,y){
+  let c=false;
+  for(let i=0,j=bound.length-1;i<bound.length;j=i++){
+    const a=bound[i],b=bound[j];
+    if((a.y>y)!==(b.y>y)&&x<(b.x-a.x)*(y-a.y)/(b.y-a.y)+a.x)c=!c;
+  }
+  return c;
+}
+function setBoundary(poly){
+  bound=poly;boundLayer.clearLayers();
+  L.polygon(poly.map(p=>toLL(p)),{color:'#00e5ff',weight:3,dashArray:'8 6',fillOpacity:.05,interactive:false}).addTo(boundLayer);
+  let a=0,x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+  for(let i=0;i<poly.length;i++){
+    const p=poly[i],q=poly[(i+1)%poly.length];
+    a+=p.x*q.y-q.x*p.y;
+    x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y);
+  }
+  boundArea=Math.abs(a)/2;
+  const st=Math.max(1,Math.sqrt(boundArea/12000));
+  gridPts=[];
+  for(let x=x0;x<=x1;x+=st)for(let y=y0;y<=y1;y+=st)if(inPoly(x,y))gridPts.push({x,y});
+  buildLanes();stats();
+}
+function clearBoundary(){
+  bound=null;gridPts=[];laneData=null;lastDone=null;boundLayer.clearLayers();stats();
+}
+function buildLanes(){
+  laneData=null;lastDone=null;
+  if(!bound||!guide)return;
+  const sp=spacing();
+  let p0=1e9,p1=-1e9,t0=1e9,t1=-1e9;
+  for(const p of bound){
+    const ct=(p.x-A.x)*guide.nx+(p.y-A.y)*guide.ny,t=(p.x-A.x)*guide.dx+(p.y-A.y)*guide.dy;
+    p0=Math.min(p0,ct);p1=Math.max(p1,ct);t0=Math.min(t0,t);t1=Math.max(t1,t);
+  }
+  laneData=[];
+  for(let n=Math.floor(p0/sp);n<=Math.ceil(p1/sp);n++){
+    const pts=[];
+    for(let t=Math.floor(t0);t<=t1;t+=0.5){
+      const x=A.x+guide.nx*n*sp+guide.dx*t,y=A.y+guide.ny*n*sp+guide.dy*t;
+      if(inPoly(x,y))pts.push({x,y});
+    }
+    if(pts.length>=2)laneData.push({n,pts});
+  }
+}
+function stats(){
+  if(!bound){prog.style.display='none';return}
+  prog.style.display='block';
+  let cov=0;
+  for(const p of gridPts)if(isCov(p.x,p.y))cov++;
+  const pct=gridPts.length?Math.round(100*cov/gridPts.length):0;
+  let s;
+  if(laneData){
+    let done=0;
+    for(const l of laneData){
+      let c=0;for(const p of l.pts)if(isCov(p.x,p.y))c++;
+      if(c/l.pts.length>=DONE_FRAC)done++;
+    }
+    const tot=laneData.length,rem=tot-done;
+    s='Sweeps left '+rem+' of '+tot+' · '+pct+'%';
+    if(lastDone!==null&&done>lastDone&&state==='running')say(rem>0?'Sweep complete. '+rem+' remaining':'Area complete');
+    lastDone=done;
+  }else s=pct+'% of '+Math.round(boundArea)+' m² · Mark A and B for sweep count';
+  if(tick()>60000&&length>5){
+    const rate=length*width()/(tick()/1000),mins=boundArea*(1-pct/100)/rate/60;
+    if(isFinite(mins)&&pct<100)s+=' · ~'+Math.max(1,Math.round(mins))+' min left';
+  }
+  prog.textContent=s;
+}
+
+/* ---------- drawing the boundary ---------- */
+function startDraw(m){
+  if(!origin){hint.style.display='block';hint.textContent='Waiting for GPS first';return}
+  drawMode=m;drawPts=[];drawLayer.clearLayers();follow.checked=false;
+  hint.style.display='block';
+  hint.textContent=m==='rect'?'Rectangle: tap corner 1 (1 of 3)':'Circle: tap the centre (1 of 2)';
+}
+function endDraw(){drawMode=null;drawPts=[];drawLayer.clearLayers();hint.style.display='none'}
+function tooSmall(){const m=drawMode;startDraw(m);hint.textContent='Too small. Start again: tap the first point'}
+$('brect').onclick=()=>startDraw('rect');
+$('bcirc').onclick=()=>startDraw('circ');
+$('bclr').onclick=()=>{endDraw();clearBoundary()};
+map.on('click',e=>{
+  if(!drawMode||!origin)return;
+  const p=toXY(e.latlng.lat,e.latlng.lng);
+  drawPts.push(p);
+  L.circleMarker(e.latlng,{radius:6,color:'#00e5ff',fillColor:'#00e5ff',fillOpacity:1}).addTo(drawLayer);
+  const k=drawPts.length;
+  if(drawMode==='rect'){
+    if(k===1)hint.textContent='Tap corner 2 along the same edge (2 of 3)';
+    else if(k===2){
+      L.polyline(drawPts.map(q=>toLL(q)),{color:'#00e5ff',weight:2}).addTo(drawLayer);
+      hint.textContent='Tap any point on the opposite side (3 of 3)';
+    }else{
+      const [p1,p2,p3]=drawPts,len=Math.hypot(p2.x-p1.x,p2.y-p1.y);
+      if(len<2)return tooSmall();
+      const ux=(p2.x-p1.x)/len,uy=(p2.y-p1.y)/len,vx=-uy,vy=ux;
+      const h=(p3.x-p1.x)*vx+(p3.y-p1.y)*vy;
+      if(Math.abs(h)<2)return tooSmall();
+      setBoundary([p1,p2,{x:p2.x+vx*h,y:p2.y+vy*h},{x:p1.x+vx*h,y:p1.y+vy*h}]);
+      endDraw();
+    }
+  }else{
+    if(k===1)hint.textContent='Tap a point on the edge (2 of 2)';
+    else{
+      const c=drawPts[0],r=Math.hypot(p.x-c.x,p.y-c.y);
+      if(r<2)return tooSmall();
+      const poly=[];
+      for(let i=0;i<48;i++){const a=i/48*2*Math.PI;poly.push({x:c.x+Math.cos(a)*r,y:c.y+Math.sin(a)*r})}
+      setBoundary(poly);endDraw();
+    }
+  }
+});
+
+/* ---------- run control ---------- */
 async function keepAwake(on){
   try{
     if(on&&'wakeLock' in navigator)lock=await navigator.wakeLock.request('screen');
@@ -82,98 +219,16 @@ go.onclick=()=>{
 };
 fin.onclick=()=>{stopRun('finished');say('Finished');ui()};
 $('clr').onclick=()=>{
-  stopRun('idle');segs=[];swathLayer.clearLayers();length=0;elapsed=0;
-  clearGuide();ui();
+  stopRun('idle');segs=[];swathLayer.clearLayers();length=0;elapsed=0;covered.clear();
+  clearGuide();endDraw();clearBoundary();ui();
 };
-function clearGuide(){A=null;guide=null;laneIdx=null;gstage=0;herr=null;lanesLayer.clearLayers();mark.textContent='Mark A'}
+function clearGuide(){
+  A=null;guide=null;laneIdx=null;gstage=0;herr=null;laneData=null;lastDone=null;
+  lanesLayer.clearLayers();mark.textContent='Mark A';stats();
+}
 mark.onclick=()=>{
   if(!cur)return;
   if(gstage===0){A={x:cur.x,y:cur.y};gstage=1;mark.textContent='Mark B';say('Point A marked')}
   else if(gstage===1){
     const dx=cur.x-A.x,dy=cur.y-A.y,d=Math.hypot(dx,dy);
-    if(d<10){steer.textContent='Move 10 m+ from A, then Mark B';say('Move further from A');return}
-    guide={dx:dx/d,dy:dy/d,nx:-dy/d,ny:dx/d};
-    gstage=2;laneIdx=null;mark.textContent='Clear guide';say('Guide line set');
-  }else{clearGuide();say('Guide cleared')}
-  guidance();
-};
-function ui(){
-  go.textContent=state==='running'?'Pause':state==='paused'?'Resume':'Start';
-  go.disabled=state==='finished';
-  fin.disabled=!(state==='running'||state==='paused');
-  me.setStyle({fillColor:state==='running'?'#fff':'#f5a623'});
-  text();
-}
-function fmt(ms){const s=Math.floor(ms/1000);return Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
-function text(){
-  const warn=acc!=null&&acc>MAX_ACC?'  ⚠ GPS weak, not recording':'';
-  info.textContent=
-`Status ${state.toUpperCase()}
-Accuracy ±${acc==null?'–':acc.toFixed(0)} m${warn}
-Speed ${spd==null?'–':(spd*3.6).toFixed(1)} km/h  Heading ${heading==null?'–':heading.toFixed(0)}°
-Mowed ${(length*width()).toFixed(0)} m²  Time ${fmt(tick())}`+
-(guide?`\nLane ${laneIdx} (spacing ${spacing().toFixed(2)} m)  Angle off ${herr==null?'–':herr.toFixed(1)}°`:'');
-}
-function drawLanes(){
-  lanesLayer.clearLayers();
-  if(!guide)return;
-  const sp=spacing(),c=laneIdx==null?0:laneIdx;
-  for(let n=c-5;n<=c+5;n++){
-    const ox=A.x+guide.nx*n*sp,oy=A.y+guide.ny*n*sp,on=n===c;
-    L.polyline([toLL({x:ox-guide.dx*150,y:oy-guide.dy*150}),toLL({x:ox+guide.dx*150,y:oy+guide.dy*150})],
-      {color:on?'#ffd400':'#fff',weight:on?3:1.5,opacity:on?1:.6,dashArray:on?null:'6 6'}).addTo(lanesLayer);
-  }
-}
-function guidance(){
-  if(gstage===0){steer.style.color='#fff';steer.textContent='Mark A at the start of your first pass';return}
-  if(gstage===1){steer.style.color='#fff';steer.textContent='Drive the first pass, then Mark B';return}
-  const sp=spacing();
-  const ct=(cur.x-A.x)*guide.nx+(cur.y-A.y)*guide.ny;
-  const idx=Math.round(ct/sp),e=ct-idx*sp;
-  if(idx!==laneIdx){laneIdx=idx;drawLanes()}
-  let sign=1;herr=null;
-  if(heading!=null){
-    const dot=Math.sin(heading*K)*guide.dx+Math.cos(heading*K)*guide.dy;
-    sign=dot>=0?1:-1;herr=Math.acos(Math.min(1,Math.abs(dot)))/K;
-  }
-  const left=e*sign; // + means you are left of the lane, as you face
-  const t=parseFloat(tol.value)||0.3,abs=Math.abs(left),now=Date.now();
-  if(now-lastAbsT>1000){converging=lastAbs!=null&&abs<lastAbs-0.03;lastAbs=abs;lastAbsT=now}
-  const moving=spd!=null&&spd>=MIN_SPEED&&acc<=MAX_ACC;
-  if(abs<=t){
-    steer.style.color='#5be37d';steer.textContent='ON LINE ✓';
-    if(wasOff&&state==='running'&&moving&&now-lastSpeak>2000){say('On line');lastSpeak=now}
-    wasOff=false;
-  }else{
-    steer.style.color='#ffb347';
-    steer.textContent=(left>0?'STEER RIGHT ▶ ':'◀ STEER LEFT ')+abs.toFixed(1)+' m';
-    wasOff=true;
-    if(state==='running'&&moving&&!converging&&now-lastSpeak>4000){
-      say(abs>3?'Off line':(left>0?'Turn back right, ':'Turn back left, ')+abs.toFixed(1)+' metres');
-      lastSpeak=now;
-    }
-  }
-}
-navigator.geolocation.watchPosition(p=>{
-  const q=p.coords;
-  if(!origin){
-    origin={lat:q.latitude,lon:q.longitude};
-    me.addTo(map);head.addTo(map);map.setView([q.latitude,q.longitude],18);
-  }
-  cur=toXY(q.latitude,q.longitude);acc=q.accuracy;spd=q.speed;
-  if(q.heading!=null&&!isNaN(q.heading))heading=q.heading;
-  const ll=[q.latitude,q.longitude];
-  me.setLatLng(ll);
-  if(heading!=null){const a=heading*K;head.setLatLngs([ll,toLL({x:cur.x+Math.sin(a)*4,y:cur.y+Math.cos(a)*4})])}
-  if(follow.checked)map.setView(ll,map.getZoom(),{animate:false});
-  if(state==='running'&&acc>MAX_ACC&&Date.now()-lastWeak>20000){say('GPS signal weak');lastWeak=Date.now()}
-  if(state==='running'&&acc<=MAX_ACC&&(spd==null||spd>=MIN_SPEED)){
-    const last=seg.pts[seg.pts.length-1];
-    const d=last?Math.hypot(cur.x-last.x,cur.y-last.y):0;
-    if(!last||d>=1){seg.pts.push(cur);seg.line.addLatLng(ll);length+=d}
-  }
-  guidance();text();
-},e=>info.textContent=e.message,{enableHighAccuracy:true,maximumAge:0});
-setInterval(text,1000);
-ui();
-</script>
+    if(d
