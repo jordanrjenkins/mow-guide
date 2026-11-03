@@ -2,27 +2,68 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{margin:0;font:18px sans-serif;background:#111;color:#fff}
-#bar{padding:8px;display:flex;gap:8px;align-items:center}
+.row{padding:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 input{width:70px;font-size:20px}
-button{font-size:18px}
-canvas{display:block;width:100vw;height:70vh;background:#1b3a1b}
+button{font-size:20px;padding:10px 14px;border:0;border-radius:10px;background:#e5e5ea}
+#go{background:#2e9d3f;color:#fff}
+#fin{background:#c0392b;color:#fff}
+button:disabled{opacity:.4}
+canvas{display:block;width:100vw;height:55vh;background:#1b3a1b}
 #info{padding:8px;font:16px monospace;white-space:pre}
 </style>
-<div id="bar">Width (m) <input id="w" type="number" value="1.5" step="0.1"> <button id="clr">Clear</button></div>
+<div class="row">Width (m) <input id="w" type="number" value="1.5" step="0.1"> <button id="clr">New job</button></div>
+<div class="row"><button id="go">Start</button><button id="fin" disabled>Finish</button></div>
 <canvas id="c"></canvas>
 <div id="info">Waiting for GPS…</div>
 <script>
 const c=document.getElementById('c'),x=c.getContext('2d');
 const w=document.getElementById('w'),info=document.getElementById('info');
-const PPM=8; // screen pixels per metre
-let origin=null,pts=[],cur=null,heading=null;
+const go=document.getElementById('go'),fin=document.getElementById('fin');
+const PPM=8,MAX_ACC=10,MIN_SPEED=0.3;
+let origin=null,cur=null,heading=null,acc=null,spd=null;
+let state='idle',segs=[],seg=null,length=0,runStart=0,elapsed=0,lock=null;
+
 function resize(){c.width=c.clientWidth*devicePixelRatio;c.height=c.clientHeight*devicePixelRatio;draw()}
 addEventListener('resize',resize);
-document.getElementById('clr').onclick=()=>{pts=[];draw()};
 function toXY(lat,lon){
   const R=6371000,k=Math.PI/180;
-  return {x:(lon-origin.lon)*k*R*Math.cos(origin.lat*k),
-          y:(lat-origin.lat)*k*R};
+  return {x:(lon-origin.lon)*k*R*Math.cos(origin.lat*k),y:(lat-origin.lat)*k*R};
+}
+async function keepAwake(on){
+  try{
+    if(on&&'wakeLock' in navigator)lock=await navigator.wakeLock.request('screen');
+    else if(lock){await lock.release();lock=null}
+  }catch(e){}
+}
+function tick(){return elapsed+(state==='running'?Date.now()-runStart:0)}
+function startRun(){seg=[];segs.push(seg);state='running';runStart=Date.now();keepAwake(true)}
+function stopRun(newState){
+  if(state==='running')elapsed+=Date.now()-runStart;
+  state=newState;seg=null;if(newState==='finished')keepAwake(false);
+}
+go.onclick=()=>{
+  if(state==='running')stopRun('paused');else startRun();
+  ui();
+};
+fin.onclick=()=>{stopRun('finished');ui()};
+document.getElementById('clr').onclick=()=>{
+  stopRun('idle');segs=[];length=0;elapsed=0;keepAwake(false);ui();
+};
+function ui(){
+  go.textContent=state==='running'?'Pause':state==='paused'?'Resume':'Start';
+  go.disabled=state==='finished';
+  fin.disabled=!(state==='running'||state==='paused');
+  draw();text();
+}
+function fmt(ms){const s=Math.floor(ms/1000);return Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
+function text(){
+  const width=parseFloat(w.value)||1.5;
+  const warn=acc!=null&&acc>MAX_ACC?'  ⚠ GPS weak, not recording':'';
+  info.textContent=
+`Status ${state.toUpperCase()}
+Accuracy ±${acc==null?'–':acc.toFixed(0)} m${warn}
+Speed ${spd==null?'–':(spd*3.6).toFixed(1)} km/h   Heading ${heading==null?'–':heading.toFixed(0)}°
+Mowed ${(length*width).toFixed(0)} m²   Time ${fmt(tick())}`;
 }
 function draw(){
   const s=PPM*devicePixelRatio;
@@ -30,26 +71,25 @@ function draw(){
   x.clearRect(0,0,c.width,c.height);
   if(!cur)return;
   x.translate(c.width/2,c.height/2);
-  x.scale(s,-s); // y up = north
+  x.scale(s,-s);
   x.translate(-cur.x,-cur.y);
-  // grid every 10 m
   x.lineWidth=1/s;x.strokeStyle='rgba(255,255,255,.2)';
   const gx=Math.floor((cur.x-60)/10)*10,gy=Math.floor((cur.y-60)/10)*10;
   for(let i=0;i<=12;i++){
     x.beginPath();x.moveTo(gx+i*10,gy);x.lineTo(gx+i*10,gy+120);x.stroke();
     x.beginPath();x.moveTo(gx,gy+i*10);x.lineTo(gx+120,gy+i*10);x.stroke();
   }
-  // mowed swath
-  if(pts.length>1){
-    x.lineWidth=parseFloat(w.value)||1.5;
-    x.lineJoin='round';x.lineCap='butt';
-    x.strokeStyle='#9be15d';
-    x.beginPath();x.moveTo(pts[0].x,pts[0].y);
-    for(const p of pts)x.lineTo(p.x,p.y);
-    x.lineTo(cur.x,cur.y);x.stroke();
+  x.lineWidth=parseFloat(w.value)||1.5;
+  x.lineJoin='round';x.lineCap='butt';x.strokeStyle='#9be15d';
+  for(const sg of segs){
+    if(!sg.length)continue;
+    x.beginPath();x.moveTo(sg[0].x,sg[0].y);
+    for(const p of sg)x.lineTo(p.x,p.y);
+    if(sg===seg&&state==='running')x.lineTo(cur.x,cur.y);
+    x.stroke();
   }
-  // you
-  x.fillStyle='#fff';x.beginPath();x.arc(cur.x,cur.y,0.7,0,7);x.fill();
+  x.fillStyle=state==='running'?'#fff':'#f5a623';
+  x.beginPath();x.arc(cur.x,cur.y,0.7,0,7);x.fill();
   if(heading!=null){
     const a=heading*Math.PI/180;
     x.strokeStyle='#fff';x.lineWidth=0.3;
@@ -61,11 +101,15 @@ navigator.geolocation.watchPosition(p=>{
   const q=p.coords;
   if(!origin)origin={lat:q.latitude,lon:q.longitude};
   cur=toXY(q.latitude,q.longitude);
+  acc=q.accuracy;spd=q.speed;
   if(q.heading!=null&&!isNaN(q.heading))heading=q.heading;
-  const last=pts[pts.length-1];
-  if(q.accuracy<=20&&(!last||Math.hypot(cur.x-last.x,cur.y-last.y)>=1))pts.push(cur);
-  info.textContent=`Accuracy ±${q.accuracy.toFixed(0)} m\nSpeed ${q.speed==null?'–':(q.speed*3.6).toFixed(1)} km/h\nHeading ${heading==null?'–':heading.toFixed(0)}°\nPoints ${pts.length}`;
-  draw();
+  if(state==='running'&&acc<=MAX_ACC&&(spd==null||spd>=MIN_SPEED)){
+    const last=seg[seg.length-1];
+    const d=last?Math.hypot(cur.x-last.x,cur.y-last.y):0;
+    if(!last||d>=1){seg.push(cur);length+=d}
+  }
+  draw();text();
 },e=>info.textContent=e.message,{enableHighAccuracy:true,maximumAge:0});
-resize();
+setInterval(text,1000);
+resize();ui();
 </script>
