@@ -30,7 +30,7 @@ let A=null,guide=null,laneIdx=null,gstage=0,herr=null;
 
 const map=L.map('map',{zoomControl:false,maxZoom:21}).setView([0,0],2);
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-  {maxNativeZoom:19,maxZoom:21,attribution:'Imagery © Esri'}).addTo(map);
+  {maxNativeZoom:17,maxZoom:21,attribution:'Imagery © Esri'}).addTo(map);
 const lanesLayer=L.layerGroup().addTo(map),swathLayer=L.layerGroup().addTo(map);
 const me=L.circleMarker([0,0],{radius:8,color:'#000',weight:2,fillColor:'#fff',fillOpacity:1});
 const head=L.polyline([],{color:'#fff',weight:3});
