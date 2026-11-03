@@ -134,7 +134,7 @@ navigator.geolocation.watchPosition(p=>{
   const q=p.coords;
   if(!origin){
     origin={lat:q.latitude,lon:q.longitude};
-    me.addTo(map);head.addTo(map);map.setView([q.latitude,q.longitude],19);
+    me.addTo(map);head.addTo(map);map.setView([q.latitude,q.longitude],18);
   }
   cur=toXY(q.latitude,q.longitude);acc=q.accuracy;spd=q.speed;
   if(q.heading!=null&&!isNaN(q.heading))heading=q.heading;
