@@ -9,12 +9,13 @@ button{font-size:19px;padding:10px 14px;border:0;border-radius:10px;background:#
 #go{background:#2e9d3f;color:#fff}
 #fin{background:#c0392b;color:#fff}
 button:disabled{opacity:.4}
-#map{width:100vw;height:46vh;background:#1b3a1b}
+#map{width:100vw;height:44vh;background:#1b3a1b}
 #steer{padding:8px;font:bold 28px sans-serif;text-align:center;background:#222}
 #info{padding:8px;font:15px monospace;white-space:pre}
 </style>
 <div class="row">Width <input id="w" type="number" value="1.5" step="0.1"> Overlap <input id="ov" type="number" value="0.1" step="0.05"> Tol <input id="tol" type="number" value="0.3" step="0.1"></div>
-<div class="row"><button id="go">Start</button><button id="fin" disabled>Finish</button><button id="mark">Mark A</button><button id="clr">New job</button><label><input type="checkbox" id="follow" checked> Follow</label></div>
+<div class="row"><button id="go">Start</button><button id="fin" disabled>Finish</button><button id="mark">Mark A</button><button id="clr">New job</button></div>
+<div class="row"><label><input type="checkbox" id="follow" checked> Follow</label><label><input type="checkbox" id="snd" checked> Voice</label><button id="test">Test voice</button></div>
 <div id="map"></div>
 <div id="steer">Mark A at the start of your first pass</div>
 <div id="info">Waiting for GPS…</div>
@@ -22,11 +23,22 @@ button:disabled{opacity:.4}
 <script>
 const $=id=>document.getElementById(id);
 const w=$('w'),ov=$('ov'),tol=$('tol'),info=$('info'),steer=$('steer');
-const go=$('go'),fin=$('fin'),mark=$('mark'),follow=$('follow');
+const go=$('go'),fin=$('fin'),mark=$('mark'),follow=$('follow'),snd=$('snd');
 const R=6371000,K=Math.PI/180,MAX_ACC=10,MIN_SPEED=0.3;
 let origin=null,cur=null,heading=null,acc=null,spd=null;
 let state='idle',segs=[],seg=null,length=0,runStart=0,elapsed=0,lock=null;
 let A=null,guide=null,laneIdx=null,gstage=0,herr=null;
+let lastSpeak=0,lastWeak=0,wasOff=false,lastAbs=null,lastAbsT=0,converging=false;
+
+function say(t){
+  if(!snd.checked||!('speechSynthesis' in window))return;
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(t);u.rate=1.05;u.volume=1;
+  speechSynthesis.speak(u);
+}
+$('test').onclick=()=>{
+  const was=snd.checked;snd.checked=true;say('Turn back right, point six metres');snd.checked=was;
+};
 
 const map=L.map('map',{zoomControl:false,maxZoom:21}).setView([0,0],2);
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -56,6 +68,7 @@ function tick(){return elapsed+(state==='running'?Date.now()-runStart:0)}
 function startRun(){
   const line=L.polyline([],{color:'#9be15d',weight:wpx(width()),opacity:.65,lineCap:'butt',lineJoin:'round'}).addTo(swathLayer);
   seg={pts:[],line};segs.push(seg);state='running';runStart=Date.now();keepAwake(true);
+  lastSpeak=Date.now();wasOff=false;lastAbs=null;
 }
 function stopRun(ns){
   if(state==='running')elapsed+=Date.now()-runStart;
@@ -63,10 +76,11 @@ function stopRun(ns){
 }
 go.onclick=()=>{
   if(!cur)return;
-  if(state==='running')stopRun('paused');else startRun();
+  if(state==='running'){stopRun('paused');say('Paused')}
+  else{startRun();say('Recording')}
   ui();
 };
-fin.onclick=()=>{stopRun('finished');ui()};
+fin.onclick=()=>{stopRun('finished');say('Finished');ui()};
 $('clr').onclick=()=>{
   stopRun('idle');segs=[];swathLayer.clearLayers();length=0;elapsed=0;
   clearGuide();ui();
@@ -74,13 +88,13 @@ $('clr').onclick=()=>{
 function clearGuide(){A=null;guide=null;laneIdx=null;gstage=0;herr=null;lanesLayer.clearLayers();mark.textContent='Mark A'}
 mark.onclick=()=>{
   if(!cur)return;
-  if(gstage===0){A={x:cur.x,y:cur.y};gstage=1;mark.textContent='Mark B'}
+  if(gstage===0){A={x:cur.x,y:cur.y};gstage=1;mark.textContent='Mark B';say('Point A marked')}
   else if(gstage===1){
     const dx=cur.x-A.x,dy=cur.y-A.y,d=Math.hypot(dx,dy);
-    if(d<10){steer.textContent='Move 10 m+ from A, then Mark B';return}
+    if(d<10){steer.textContent='Move 10 m+ from A, then Mark B';say('Move further from A');return}
     guide={dx:dx/d,dy:dy/d,nx:-dy/d,ny:dx/d};
-    gstage=2;laneIdx=null;mark.textContent='Clear guide';
-  }else clearGuide();
+    gstage=2;laneIdx=null;mark.textContent='Clear guide';say('Guide line set');
+  }else{clearGuide();say('Guide cleared')}
   guidance();
 };
 function ui(){
@@ -123,11 +137,21 @@ function guidance(){
     sign=dot>=0?1:-1;herr=Math.acos(Math.min(1,Math.abs(dot)))/K;
   }
   const left=e*sign; // + means you are left of the lane, as you face
-  const t=parseFloat(tol.value)||0.3;
-  if(Math.abs(left)<=t){steer.style.color='#5be37d';steer.textContent='ON LINE ✓'}
-  else{
+  const t=parseFloat(tol.value)||0.3,abs=Math.abs(left),now=Date.now();
+  if(now-lastAbsT>1000){converging=lastAbs!=null&&abs<lastAbs-0.03;lastAbs=abs;lastAbsT=now}
+  const moving=spd!=null&&spd>=MIN_SPEED&&acc<=MAX_ACC;
+  if(abs<=t){
+    steer.style.color='#5be37d';steer.textContent='ON LINE ✓';
+    if(wasOff&&state==='running'&&moving&&now-lastSpeak>2000){say('On line');lastSpeak=now}
+    wasOff=false;
+  }else{
     steer.style.color='#ffb347';
-    steer.textContent=(left>0?'STEER RIGHT ▶ ':'◀ STEER LEFT ')+Math.abs(left).toFixed(1)+' m';
+    steer.textContent=(left>0?'STEER RIGHT ▶ ':'◀ STEER LEFT ')+abs.toFixed(1)+' m';
+    wasOff=true;
+    if(state==='running'&&moving&&!converging&&now-lastSpeak>4000){
+      say(abs>3?'Off line':(left>0?'Turn back right, ':'Turn back left, ')+abs.toFixed(1)+' metres');
+      lastSpeak=now;
+    }
   }
 }
 navigator.geolocation.watchPosition(p=>{
@@ -142,6 +166,7 @@ navigator.geolocation.watchPosition(p=>{
   me.setLatLng(ll);
   if(heading!=null){const a=heading*K;head.setLatLngs([ll,toLL({x:cur.x+Math.sin(a)*4,y:cur.y+Math.cos(a)*4})])}
   if(follow.checked)map.setView(ll,map.getZoom(),{animate:false});
+  if(state==='running'&&acc>MAX_ACC&&Date.now()-lastWeak>20000){say('GPS signal weak');lastWeak=Date.now()}
   if(state==='running'&&acc<=MAX_ACC&&(spd==null||spd>=MIN_SPEED)){
     const last=seg.pts[seg.pts.length-1];
     const d=last?Math.hypot(cur.x-last.x,cur.y-last.y):0;
